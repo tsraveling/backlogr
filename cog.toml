@@ -1,0 +1,7 @@
+from_latest_tag = true
+tag_prefix = "v"
+
+pre_bump_hooks = [
+    "sed -i.bak 's|const Version = .*|const Version = \"{{version}}\"|' version.go && rm -f version.go.bak",
+    "git add version.go",
+]
