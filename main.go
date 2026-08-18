@@ -1,4 +1,5 @@
-// backlogr: log into Steam, show the first unplayed game in your library, alphabetically.
+// backlogr: log into Steam, pick an unplayed game from your library, and stick with it
+// until you play it, skip it, or ask for the next one.
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +28,7 @@ import (
 	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 )
 
 const (
@@ -212,6 +215,55 @@ func addSkip(appID int) error {
 	return err
 }
 
+// the game we are currently pointing the player at, with the playtime it had
+// when we picked it, so we can show hours played since
+type current struct {
+	AppID    int `json:"appid"`
+	Baseline int `json:"baseline"`
+}
+
+func loadCurrent() *current {
+	path, err := configPath("current")
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var c current
+	if err := json.Unmarshal(data, &c); err != nil || c.AppID == 0 {
+		return nil
+	}
+	return &c
+}
+
+func saveCurrent(c current) error {
+	path, err := configPath("current")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o600)
+}
+
+func clearCurrent() error {
+	path, err := configPath("current")
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func resetSkips() error {
 	path, err := configPath("skipped")
 	if err != nil {
@@ -220,7 +272,7 @@ func resetSkips() error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return nil
+	return clearCurrent()
 }
 
 func cachedSteamID() string {
@@ -256,9 +308,12 @@ var steamID64Re = regexp.MustCompile(`^\d{17}$`)
 
 func main() {
 	relogin := flag.Bool("login", false, "force a fresh Steam login, ignoring the cached SteamID")
-	skip := flag.Bool("skip", false, "mark the current game as skipped and show the next one")
+	skip := flag.Bool("skip", false, "mark the current game as skipped and pick another")
 	reset := flag.Bool("reset", false, "clear all skips")
 	newKey := flag.Bool("key", false, "enter a new Steam API key, replacing the saved one")
+	var sequential bool
+	flag.BoolVar(&sequential, "sequential", false, "pick the next unplayed game alphabetically instead of at random")
+	flag.BoolVar(&sequential, "s", false, "shorthand for --sequential")
 	flag.Parse()
 
 	if *reset {
@@ -278,7 +333,7 @@ func main() {
 
 	if !*relogin {
 		if id := cachedSteamID(); id != "" {
-			if err := report(apiKey, id, *skip); err != nil {
+			if err := report(apiKey, id, *skip, sequential); err != nil {
 				log.Fatal(ErrorStyle.Render(err.Error()))
 			}
 			return
@@ -307,7 +362,7 @@ func main() {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		if err := report(apiKey, steamID, *skip); err != nil {
+		if err := report(apiKey, steamID, *skip, sequential); err != nil {
 			log.Print(err)
 		}
 	})
@@ -379,59 +434,116 @@ type game struct {
 	Playtime int    `json:"playtime_forever"`
 }
 
-// prints the first unplayed, unskipped game; skip marks that game as skipped
-// first, so the one after it is shown instead
-func report(apiKey, steamID string, skip bool) error {
+// shows the current game and how long it has been played since we picked it.
+// With nothing current (or after a skip) it picks one: at random by default,
+// alphabetically first in sequential mode. Once the current game has any
+// playtime, space draws the next one.
+func report(apiKey, steamID string, skip, sequential bool) error {
 	games, err := ownedGames(apiKey, steamID)
 	if err != nil {
 		return err
 	}
+	byID := map[int]game{}
+	for _, g := range games {
+		byID[g.AppID] = g
+	}
 	skips := loadSkips()
 
-	var unplayed []game
-	for _, g := range games {
-		if g.Playtime == 0 && !skips[g.AppID] {
-			unplayed = append(unplayed, g)
+	cur := loadCurrent()
+	if cur != nil {
+		if _, ok := byID[cur.AppID]; !ok || skips[cur.AppID] {
+			cur = nil
+			clearCurrent()
 		}
 	}
-	sort.Slice(unplayed, func(i, j int) bool {
-		a, b := sortKey(unplayed[i].Name), sortKey(unplayed[j].Name)
+
+	if skip {
+		if cur == nil {
+			fmt.Println(HelpStyle.Render("nothing to skip"))
+		} else {
+			if err := addSkip(cur.AppID); err != nil {
+				return err
+			}
+			fmt.Println(HelpStyle.Render("skipped " + byID[cur.AppID].Name))
+			skips[cur.AppID] = true
+			cur = nil
+			if err := clearCurrent(); err != nil {
+				return err
+			}
+		}
+	}
+
+	for {
+		if cur == nil {
+			pool := unplayedPool(games, skips)
+			if len(pool) == 0 {
+				return noneLeft(len(games), len(skips))
+			}
+			pick := pool[rand.IntN(len(pool))]
+			if sequential {
+				pick = pool[0]
+			}
+			cur = &current{AppID: pick.AppID, Baseline: pick.Playtime}
+			if err := saveCurrent(*cur); err != nil {
+				return err
+			}
+		}
+
+		g := byID[cur.AppID]
+		played := g.Playtime - cur.Baseline
+		if played < 0 {
+			played = 0
+		}
+		render(g, played, len(unplayedPool(games, skips)), len(games), len(skips))
+
+		if played == 0 || !waitForNext() {
+			return nil
+		}
+		cur = nil
+		if err := clearCurrent(); err != nil {
+			return err
+		}
+	}
+}
+
+// every owned game with no playtime that has not been skipped, in library order
+func unplayedPool(games []game, skips map[int]bool) []game {
+	var pool []game
+	for _, g := range games {
+		if g.Playtime == 0 && !skips[g.AppID] {
+			pool = append(pool, g)
+		}
+	}
+	sort.Slice(pool, func(i, j int) bool {
+		a, b := sortKey(pool[i].Name), sortKey(pool[j].Name)
 		if a != b {
 			return a < b
 		}
-		return unplayed[i].Name < unplayed[j].Name
+		return pool[i].Name < pool[j].Name
 	})
+	return pool
+}
 
-	if skip && len(unplayed) > 0 {
-		skipped := unplayed[0]
-		if err := addSkip(skipped.AppID); err != nil {
-			return err
-		}
-		fmt.Println(HelpStyle.Render("skipped " + skipped.Name))
-		unplayed = unplayed[1:]
-		skips[skipped.AppID] = true
+func noneLeft(owned, skipped int) error {
+	msg := fmt.Sprintf("No unplayed games left in %d owned. Impressive.", owned)
+	if skipped > 0 {
+		msg = fmt.Sprintf("Nothing left — %d skipped. Run with --reset to start over.", skipped)
 	}
+	fmt.Println(ViewStyle.Render(TitleStyle.Render(msg)))
+	return clearCurrent()
+}
 
-	if len(unplayed) == 0 {
-		msg := fmt.Sprintf("No unplayed games left in %d owned. Impressive.", len(games))
-		if len(skips) > 0 {
-			msg = fmt.Sprintf("Nothing left — %d skipped. Run with --reset to start over.", len(skips))
-		}
-		fmt.Println(ViewStyle.Render(TitleStyle.Render(msg)))
-		return nil
-	}
-
-	g := unplayed[0]
+func render(g game, played, unplayed, owned, skipped int) {
 	desc, err := shortDescription(g.AppID)
 	if err != nil {
 		desc = "(no description available)"
 	}
 
-	meta := MetaStyle.Render(fmt.Sprintf("0 hours played · app %d · ", g.AppID)) +
-		CountStyle.Render(fmt.Sprint(len(unplayed))) +
-		MetaStyle.Render(fmt.Sprintf(" unplayed of %d owned", len(games)))
-	if len(skips) > 0 {
-		meta += MetaStyle.Render(fmt.Sprintf(" · %d skipped", len(skips)))
+	meta := MetaStyle.Render(playedText(played)+fmt.Sprintf(" · app %d · ", g.AppID)) +
+		CountStyle.Render(fmt.Sprint(unplayed)) +
+		MetaStyle.Render(fmt.Sprintf(" unplayed of %d owned", owned))
+	if skipped > 0 {
+		meta += MetaStyle.Render(fmt.Sprintf(" · %d skipped", skipped))
 	}
 
 	fmt.Println(ViewStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
@@ -439,7 +551,40 @@ func report(apiKey, steamID string, skip bool) error {
 		meta,
 		DescStyle.Render(desc),
 	)))
-	return nil
+	if played > 0 {
+		fmt.Println(HelpStyle.Render("  space for next"))
+	}
+}
+
+// playtime since we picked the game
+func playedText(mins int) string {
+	switch {
+	case mins == 0:
+		return "0 hours played"
+	case mins < 60:
+		return fmt.Sprintf("%d minutes played", mins)
+	}
+	return fmt.Sprintf("%.1f hours played", float64(mins)/60)
+}
+
+// true if the user asked for the next game; false on anything else, or when
+// there is no terminal to read from
+func waitForNext() bool {
+	fd := os.Stdin.Fd()
+	if !term.IsTerminal(fd) {
+		return false
+	}
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return false
+	}
+	defer term.Restore(fd, state)
+
+	var buf [1]byte
+	if _, err := os.Stdin.Read(buf[:]); err != nil {
+		return false
+	}
+	return buf[0] == ' '
 }
 
 // mimics Steam's library ordering: case-insensitive, leading punctuation and
