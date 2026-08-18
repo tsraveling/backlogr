@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -306,15 +308,61 @@ func cacheSteamID(id string) {
 
 var steamID64Re = regexp.MustCompile(`^\d{17}$`)
 
+// everything the run needs beyond credentials
+type options struct {
+	skip           bool
+	sequential     bool
+	list           bool
+	drawdeck       string
+	format         string
+	thresholdHours float64
+	thresholdMins  int
+}
+
+// true when we are printing or writing the pool instead of drawing from it
+func (o options) listing() bool { return o.list || o.drawdeck != "" }
+
+func (o options) validate() error {
+	if o.thresholdHours < 0 {
+		return fmt.Errorf("--threshold cannot be negative")
+	}
+	if !slices.Contains(validFormats, o.format) {
+		return fmt.Errorf("unknown --format %q (valid: %s)", o.format, strings.Join(validFormats, ", "))
+	}
+	if o.format != formatPlain && (!o.list || o.drawdeck != "") {
+		return fmt.Errorf("--format only applies to --list")
+	}
+	if o.listing() && o.skip {
+		return fmt.Errorf("--skip has nothing to skip alongside --list or --drawdeck")
+	}
+	if o.listing() && o.sequential {
+		return fmt.Errorf("--sequential does nothing alongside --list or --drawdeck; listing is always alphabetical")
+	}
+	return nil
+}
+
 func main() {
 	relogin := flag.Bool("login", false, "force a fresh Steam login, ignoring the cached SteamID")
 	skip := flag.Bool("skip", false, "mark the current game as skipped and pick another")
 	reset := flag.Bool("reset", false, "clear all skips")
 	newKey := flag.Bool("key", false, "enter a new Steam API key, replacing the saved one")
-	var sequential bool
-	flag.BoolVar(&sequential, "sequential", false, "pick the next unplayed game alphabetically instead of at random")
-	flag.BoolVar(&sequential, "s", false, "shorthand for --sequential")
+	var opt options
+	flag.BoolVar(&opt.sequential, "sequential", false, "pick the next unplayed game alphabetically instead of at random")
+	flag.BoolVar(&opt.sequential, "s", false, "shorthand for --sequential")
+	flag.BoolVar(&opt.list, "list", false, "list every matching game instead of drawing one")
+	flag.BoolVar(&opt.list, "l", false, "shorthand for --list")
+	flag.Float64Var(&opt.thresholdHours, "threshold", 0, "treat games under this many hours as unplayed")
+	flag.Float64Var(&opt.thresholdHours, "t", 0, "shorthand for --threshold")
+	flag.StringVar(&opt.format, "format", formatPlain, "list format: plain, md-checklist, csv, tsv")
+	flag.StringVar(&opt.format, "f", formatPlain, "shorthand for --format")
+	flag.StringVar(&opt.drawdeck, "drawdeck", "", "write the matching games to a drawdeck markdown file")
 	flag.Parse()
+
+	opt.skip = *skip
+	if err := opt.validate(); err != nil {
+		log.Fatal(ErrorStyle.Render(err.Error()))
+	}
+	opt.thresholdMins = int(math.Round(opt.thresholdHours * 60))
 
 	if *reset {
 		if err := resetSkips(); err != nil {
@@ -333,7 +381,7 @@ func main() {
 
 	if !*relogin {
 		if id := cachedSteamID(); id != "" {
-			if err := report(apiKey, id, *skip, sequential); err != nil {
+			if err := report(apiKey, id, opt); err != nil {
 				log.Fatal(ErrorStyle.Render(err.Error()))
 			}
 			return
@@ -362,7 +410,7 @@ func main() {
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		if err := report(apiKey, steamID, *skip, sequential); err != nil {
+		if err := report(apiKey, steamID, opt); err != nil {
 			log.Print(err)
 		}
 	})
@@ -438,7 +486,7 @@ type game struct {
 // With nothing current (or after a skip) it picks one: at random by default,
 // alphabetically first in sequential mode. Once the current game has any
 // playtime, space draws the next one.
-func report(apiKey, steamID string, skip, sequential bool) error {
+func report(apiKey, steamID string, opt options) error {
 	games, err := ownedGames(apiKey, steamID)
 	if err != nil {
 		return err
@@ -449,6 +497,10 @@ func report(apiKey, steamID string, skip, sequential bool) error {
 	}
 	skips := loadSkips()
 
+	if opt.listing() {
+		return listGames(games, skips, opt)
+	}
+
 	cur := loadCurrent()
 	if cur != nil {
 		if _, ok := byID[cur.AppID]; !ok || skips[cur.AppID] {
@@ -457,7 +509,7 @@ func report(apiKey, steamID string, skip, sequential bool) error {
 		}
 	}
 
-	if skip {
+	if opt.skip {
 		if cur == nil {
 			fmt.Println(HelpStyle.Render("nothing to skip"))
 		} else {
@@ -475,13 +527,13 @@ func report(apiKey, steamID string, skip, sequential bool) error {
 
 	for {
 		if cur == nil {
-			pool := unplayedPool(games, skips)
-			if len(pool) == 0 {
-				return noneLeft(len(games), len(skips))
+			candidates := pool(games, skips, opt.thresholdMins)
+			if len(candidates) == 0 {
+				return noneLeft(len(games), len(skips), opt.thresholdHours)
 			}
-			pick := pool[rand.IntN(len(pool))]
-			if sequential {
-				pick = pool[0]
+			pick := candidates[rand.IntN(len(candidates))]
+			if opt.sequential {
+				pick = candidates[0]
 			}
 			cur = &current{AppID: pick.AppID, Baseline: pick.Playtime}
 			if err := saveCurrent(*cur); err != nil {
@@ -494,7 +546,7 @@ func report(apiKey, steamID string, skip, sequential bool) error {
 		if played < 0 {
 			played = 0
 		}
-		render(g, played, len(unplayedPool(games, skips)), len(games), len(skips))
+		render(g, played, len(pool(games, skips, opt.thresholdMins)), len(games), len(skips), opt.thresholdHours)
 
 		if played == 0 || !waitForNext() {
 			return nil
@@ -506,26 +558,34 @@ func report(apiKey, steamID string, skip, sequential bool) error {
 	}
 }
 
-// every owned game with no playtime that has not been skipped, in library order
-func unplayedPool(games []game, skips map[int]bool) []game {
-	var pool []game
+// under the threshold, or with no playtime at all when there is none
+func qualifies(g game, thresholdMins int) bool {
+	return g.Playtime < max(thresholdMins, 1)
+}
+
+// every owned game under the threshold that has not been skipped, in library order
+func pool(games []game, skips map[int]bool, thresholdMins int) []game {
+	var out []game
 	for _, g := range games {
-		if g.Playtime == 0 && !skips[g.AppID] {
-			pool = append(pool, g)
+		if qualifies(g, thresholdMins) && !skips[g.AppID] {
+			out = append(out, g)
 		}
 	}
-	sort.Slice(pool, func(i, j int) bool {
-		a, b := sortKey(pool[i].Name), sortKey(pool[j].Name)
+	sort.Slice(out, func(i, j int) bool {
+		a, b := sortKey(out[i].Name), sortKey(out[j].Name)
 		if a != b {
 			return a < b
 		}
-		return pool[i].Name < pool[j].Name
+		return out[i].Name < out[j].Name
 	})
-	return pool
+	return out
 }
 
-func noneLeft(owned, skipped int) error {
+func noneLeft(owned, skipped int, thresholdHours float64) error {
 	msg := fmt.Sprintf("No unplayed games left in %d owned. Impressive.", owned)
+	if thresholdHours > 0 {
+		msg = fmt.Sprintf("Nothing under %s left in %d owned.", hoursText(thresholdHours), owned)
+	}
 	if skipped > 0 {
 		msg = fmt.Sprintf("Nothing left — %d skipped. Run with --reset to start over.", skipped)
 	}
@@ -533,15 +593,15 @@ func noneLeft(owned, skipped int) error {
 	return clearCurrent()
 }
 
-func render(g game, played, unplayed, owned, skipped int) {
+func render(g game, played, matching, owned, skipped int, thresholdHours float64) {
 	desc, err := shortDescription(g.AppID)
 	if err != nil {
 		desc = "(no description available)"
 	}
 
 	meta := MetaStyle.Render(playedText(played)+fmt.Sprintf(" · app %d · ", g.AppID)) +
-		CountStyle.Render(fmt.Sprint(unplayed)) +
-		MetaStyle.Render(fmt.Sprintf(" unplayed of %d owned", owned))
+		CountStyle.Render(fmt.Sprint(matching)) +
+		MetaStyle.Render(fmt.Sprintf(" %s of %d owned", poolLabel(thresholdHours), owned))
 	if skipped > 0 {
 		meta += MetaStyle.Render(fmt.Sprintf(" · %d skipped", skipped))
 	}
